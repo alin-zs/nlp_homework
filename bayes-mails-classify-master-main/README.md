@@ -1,89 +1,87 @@
-readme_content = """
-# 邮件分类项目 README
+## 基于朴素贝叶斯的邮件分类系统
 
-## 一、代码核心功能说明
-本项目主要实现了邮件分类的功能，利用文本特征将邮件分为垃圾邮件和正常邮件两类。通过对邮件文本进行处理和特征提取，结合多项式朴素贝叶斯分类器完成分类任务，同时支持高频词特征和 TF - IDF 特征加权两种特征提取模式的切换。此外，针对样本量失衡问题进行了处理，并增加了模型评估指标。
 
-### （一）算法基础
+## 算法基础
 #### 1. 多项式朴素贝叶斯分类器
-本仓库采用多项式朴素贝叶斯分类器进行邮件分类。该分类器基于条件概率的特征独立性假设，即假设在给定类别 $C$ 的条件下，各个特征 $x_1,x_2,\cdots,x_n$ 之间是相互独立的。用数学公式表示为：
-$P(x_1,x_2,\cdots,x_n|C)=\prod_{i = 1}^{n}P(x_i|C)$
-这个假设简化了计算过程，使得我们可以分别计算每个特征在给定类别下的条件概率，然后将它们相乘得到联合条件概率。
+多项式朴素贝叶斯是一种基于贝叶斯定理和特征条件独立性假设的分类方法。在文本分类任务中，它假设每个特征（词）之间是相互独立的，即在给定类别的条件下，一个词的出现与否不影响其他词的出现概率。
 
-#### 2. 贝叶斯定理在邮件分类中的应用
+#### 2. 特征独立性假设
+基于条件概率，假设我们有文本D由一系列词$w_1,w_2,\cdots,w_n$ 组成，类别为 C 。特征独立性假设意味着$P(w_1,w_2,\cdots,w_n |C)=\prod_{i = 1}^{n}P(w_i|C)$。也就是说，在已知类别的情况下，每个词的出现概率是相互独立的，这样可以大大简化计算。
+
+#### 3. 贝叶斯定理在邮件分类中的应用
 贝叶斯定理的公式为：$P(C|x_1,x_2,\cdots,x_n)=\frac{P(x_1,x_2,\cdots,x_n|C)P(C)}{P(x_1,x_2,\cdots,x_n)}$
 在邮件分类问题中，我们的目标是判断一封邮件属于垃圾邮件（$C_1$）还是正常邮件（$C_2$），也就是要比较 $P(C_1|x_1,x_2,\cdots,x_n)$ 和 $P(C_2|x_1,x_2,\cdots,x_n)$ 的大小。由于对于同一封邮件，$P(x_1,x_2,\cdots,x_n)$ 是固定的，所以我们只需要比较分子 $P(x_1,x_2,\cdots,x_n|C)P(C)$ 的大小。结合特征独立性假设，就可以将其转化为 $\prod_{i = 1}^{n}P(x_i|C)P(C)$ 进行计算。
 
-### （二）数据处理流程
-#### 1. 分词处理
-代码中使用 `jieba.cut()` 方法对邮件文本进行分词处理。具体实现是逐行读取邮件文件，对每行文本进行清洗（去除无效字符）后，调用 `jieba.cut()` 方法将文本切分成单个的词语。例如：with open(filename, 'r', encoding='utf - 8') as fr:
-    for line in fr:
-        line = line.strip()
-        line = re.sub(r'[.【】0 - 9、——。，！~\*]', '', line)
-        line = cut(line)
-#### 2. 停用词过滤
-虽然原代码中没有显式的停用词过滤步骤，但在实际的文本处理中，停用词过滤是一个重要的预处理步骤。停用词是指在文本中频繁出现但对文本分类任务没有太大帮助的词语，如“的”“了”“是”等。可以通过定义一个停用词列表，在分词后过滤掉这些词语。示例代码如下：stopwords = set([line.strip() for line in open('stopwords.txt', 'r', encoding='utf - 8').readlines()])
-words = [word for word in words if word not in stopwords]
-### （三）特征构建过程
-#### 1. 高频词特征选择
-##### 数学表达形式
-高频词特征选择是基于词频统计的。对于一个由 $N$ 封邮件组成的语料库，我们统计每个词语在所有邮件中出现的频率，选取出现频率最高的 $k$ 个词语作为特征。对于每封邮件，我们构建一个长度为 $k$ 的向量，向量的每个元素表示对应特征词在该邮件中出现的次数。设邮件 $d$ 中特征词 $w_i$ 出现的次数为 $tf_{i,d}$，则邮件 $d$ 的特征向量可以表示为 $\vec{v_d}=(tf_{1,d},tf_{2,d},\cdots,tf_{k,d})$。
 
-##### 实现差异
-实现过程中，首先遍历所有邮件文件，将所有词语汇总到一个列表中，然后使用 `collections.Counter()` 统计每个词语的出现次数，选取出现次数最多的 $k$ 个词语作为特征词。对于每封邮件，统计这些特征词在该邮件中出现的次数，构建特征向量。示例代码如下：def get_top_words(top_num, filename_list):
-    all_words = []
-    for filename in filename_list:
-        all_words.extend(get_words(filename))
-    freq = Counter(all_words)
-    return [i[0] for i in freq.most_common(top_num)]
+## 数据处理流程
+1. **分词处理**  
+    使用结巴分词实现中文文本切分，英文采用;保留长度≥2的有效词项（过滤"的"、"是"等单字噪声）
+2. **停用词过滤**  
+   加载哈工大停用词表，剔除"的"、"是"等无意义虚词，保留领域相关核心词汇
+3. **标准化处理**  
+   - 全角转半角字符
+   - 统一小写转换
+   - 正则去除HTML标签和特殊符号
 
-top_words = get_top_words(100)
-vector = []
-for words in all_words:
-    word_map = list(map(lambda word: words.count(word), top_words))
-    vector.append(word_map)
-#### 2. TF - IDF 特征加权
-##### 数学表达形式
-TF - IDF（词频 - 逆文档频率）是一种常用的文本特征加权方法。TF（词频）表示词语在某篇文档中出现的频率，$tf_{i,d}=\frac{n_{i,d}}{\sum_{j}n_{j,d}}$，其中 $n_{i,d}$ 是词语 $w_i$ 在文档 $d$ 中出现的次数，$\sum_{j}n_{j,d}$ 是文档 $d$ 中所有词语出现的总次数。IDF（逆文档频率）表示词语在整个语料库中的普遍重要性，$idf_i=\log\frac{N}{df_i}$，其中 $N$ 是语料库中文档的总数，$df_i$ 是包含词语 $w_i$ 的文档数。TF - IDF 值为 $tfidf_{i,d}=tf_{i,d}\times idf_i$。对于每封邮件，我们构建一个向量，向量的每个元素表示对应特征词的 TF - IDF 值。
+```python
+def get_words(filename):
+    """读取文本并过滤无效字符和长度为1的词"""
+    words = []
+    with open(filename, 'r', encoding='utf-8') as fr:
+        for line in fr:
+            line = line.strip()
+            # 过滤无效字符
+            line = re.sub(r'[.【】0-9、——。，！~\*]', '', line)
+            # 使用jieba.cut()方法对文本切词处理
+            line = cut(line)
+            # 过滤长度为1的词
+            line = filter(lambda word: len(word) > 1, line)
+            words.extend(line)
+    return words
+```
 
-##### 实现差异
-在代码中，使用 `sklearn.feature_extraction.text.TfidfVectorizer` 来实现 TF - IDF 特征的计算。首先将所有邮件的分词结果组合成一个语料库，然后调用 `TfidfVectorizer` 的 `fit_transform()` 方法计算每个词语的 TF - IDF 值，得到特征矩阵。示例代码如下：corpus = []
-for filename in filename_list:
-    words = get_words(filename)
-    corpus.append(" ".join(words))
-vectorizer = TfidfVectorizer()
-vector = vectorizer.fit_transform(corpus)
-### （四）两种特征选择方式对比
-| 特征选择方式 | 优点 | 缺点 | 适用场景 |
-| --- | --- | --- | --- |
-| 高频词特征选择 | 实现简单，计算速度快 | 容易受到常用词的影响，对文本的区分能力可能不足 | 数据规模较小，文本主题相对单一 |
-| TF - IDF 特征加权 | 能够突出重要的、具有区分性的词语，对文本的表达能力更强 | 计算复杂度相对较高，需要统计整个语料库的信息 | 数据规模较大，文本主题多样 |
 
-## 二、高频词/TF - IDF 两种特征模式的切换方法
-代码中通过 `extract_features` 函数的 `feature_method` 参数来实现两种特征模式的切换。具体如下：def extract_features(filename_list, feature_method='top_words', top_num=100):
-   
-# 使用 TF - IDF 特征
-vector_tfidf, feature_names = extract_features(filename_list, feature_method='tfidf')
-## 三、样本平衡处理
-### 目标
-缓解垃圾邮件（127 条）与普通邮件（24 条）的样本量失衡问题。
+## 特征构建过程
+| 特征类型       | 数学表达                          | 实现差异                     |
+|---------------|-------------------------------|------------------------------|
+| **高频词特征** | $count(xᵢ)=ΣI(xᵢ∈文档)$         | `CountVectorizer`统计词频，选取Top-N高频词 |
+|**TF-IDF特征** | $w(xᵢ)=tf(xᵢ)*log(N/df(xᵢ))$  | `TfidfVectorizer`计算逆文档频率，L2归一化处理|
 
-### 实现方法
-在模型训练前，采用 `imblearn.over_sampling.SMOTE` 进行过采样处理。以下是相关代码示例：from imblearn.over_sampling import SMOTE
-from sklearn.model_selection import train_test_split
+**核心差异**：  
+- 高频词侧重绝对词频，适合短文本快速分类
+- TF-IDF抑制常见词影响，更强调类别区分性词汇
 
-# 假设已经获取特征向量 X 和标签 y
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+## 高频词/TF-IDF两种特征模式的切换方法
+通过在 extract_features 函数和 train_model 函数中传入 feature_type 参数来实现特征模式的切换。当 feature_type 为 'high_frequency' 时，使用高频词特征提取方法；当 feature_type 为 'tfidf' 时，使用 TF-IDF 特征加权方法。在 predict 函数中，也根据 feature_type 参数选择相应的方法构建未知邮件的特征向量进行预测。
 
-smote = SMOTE(random_state=42)
-X_train_resampled, y_train_resampled = smote.fit_resample(X_train, y_train)
+```python
+def extract_features(feature_type='high_frequency'):
+```
+---
 
-# 使用重采样后的数据进行模型训练
-model = MultinomialNB()
-model.fit(X_train_resampled, y_train_resampled)
-## 四、增加模型评估指标
-### 目标
-在基础预测功能外，输出包含精度、召回率、F1 值的分类评估报告。
 
-### 实现方法
-通过 `sklearn.metrics.classification_report` 实现多维度的模型评估。以下是代码示例：from sklearn.metrics import classification_report
+## 样本平衡处理
+在 train_model 函数中，获取特征矩阵 vector 和标签数组 labels 后，使用 SMOTE 对数据进行过采样，生成新的特征矩阵 X_resampled 和标签数组 y_resampled。
+使用过采样后的数据 X_resampled 和 y_resampled 来训练多项式朴素贝叶斯模
+```python
+ # 使用SMOTE进行过采样
+    smote = SMOTE(random_state=42)
+    X_resampled, y_resampled = smote.fit_resample(vector, labels)
+```
+---
+
+## 增加模型评估指标
+提取特征并获取真实标签，接着对训练集中的每个邮件进行预测，最后使用 classification_report 函数生成包含精度、召回率、F1 值的分类评估报告
+```python
+def evaluate_model(model, top_words, feature_type='high_frequency'):
+    vector = extract_features(feature_type)
+    labels = np.array([1] * 127 + [0] * 24)
+    predictions = []
+    for i in range(151):
+        filename = f'邮件_files/{i}.txt'
+        pred = predict(filename, model, top_words, feature_type)
+        predictions.append(pred)
+    report = classification_report(labels, predictions)
+    return report
+```
+---
