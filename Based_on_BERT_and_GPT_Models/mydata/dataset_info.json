@@ -1,0 +1,9 @@
+{
+  "dataset_name": "my_sentiment_dataset",
+  "description": "包含2条中文情感文本的示例数据集",
+  "label_classes": {
+    "0": "negative",
+    "1": "positive"
+  },
+  "creation_time": "2025-05-23"
+}

@@ -1,14 +1,16 @@
-from argparse import Namespace
 import os
+from argparse import Namespace
+from collections import Counter
 import json
+import re
+import string
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from torch.nn import functional as F
 import torch.optim as optim
-from sympy.stats.rv import probability
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
@@ -140,42 +142,56 @@ class SequenceVocabulary(Vocabulary):
 
 class SurnameVectorizer(object):
     """ The Vectorizer which coordinates the Vocabularies and puts them to use"""
+
     def __init__(self, char_vocab, nationality_vocab):
         """
         Args:
-            char_vocab (Vocabulary): maps characters to integers
+            char_vocab (SequenceVocabulary): maps words to integers
             nationality_vocab (Vocabulary): maps nationalities to integers
         """
         self.char_vocab = char_vocab
         self.nationality_vocab = nationality_vocab
 
-
     def vectorize(self, surname, vector_length=-1):
-        """
+        """Vectorize a surname into a vector of observations and targets
+
+        The outputs are the vectorized surname split into two vectors:
+            surname[:-1] and surname[1:]
+        At each timestep, the first vector is the observation and the second vector is the target.
+
         Args:
-            title (str): the string of characters
+            surname (str): the surname to be vectorized
             vector_length (int): an argument for forcing the length of index vector
+        Returns:
+            a tuple: (from_vector, to_vector)
+            from_vector (numpy.ndarray): the observation vector
+            to_vector (numpy.ndarray): the target prediction vector
         """
         indices = [self.char_vocab.begin_seq_index]
-        indices.extend(self.char_vocab.lookup_token(token)
-                       for token in surname)
+        indices.extend(self.char_vocab.lookup_token(token) for token in surname)
         indices.append(self.char_vocab.end_seq_index)
 
         if vector_length < 0:
-            vector_length = len(indices)
+            vector_length = len(indices) - 1
 
-        out_vector = np.zeros(vector_length, dtype=np.int64)
-        out_vector[:len(indices)] = indices
-        out_vector[len(indices):] = self.char_vocab.mask_index
+        from_vector = np.zeros(vector_length, dtype=np.int64)
+        from_indices = indices[:-1]
+        from_vector[:len(from_indices)] = from_indices
+        from_vector[len(from_indices):] = self.char_vocab.mask_index
 
-        return out_vector, len(indices)
+        to_vector = np.zeros(vector_length, dtype=np.int64)
+        to_indices = indices[1:]
+        to_vector[:len(to_indices)] = to_indices
+        to_vector[len(to_indices):] = self.char_vocab.mask_index
+
+        return from_vector, to_vector
 
     @classmethod
     def from_dataframe(cls, surname_df):
         """Instantiate the vectorizer from the dataset dataframe
 
         Args:
-            surname_df (pandas.DataFrame): the surnames dataset
+            surname_df (pandas.DataFrame): the surname dataset
         Returns:
             an instance of the SurnameVectorizer
         """
@@ -191,12 +207,21 @@ class SurnameVectorizer(object):
 
     @classmethod
     def from_serializable(cls, contents):
+        """Instantiate the vectorizer from saved contents
+
+        Args:
+            contents (dict): a dict holding two vocabularies for this vectorizer
+                This dictionary is created using `vectorizer.to_serializable()`
+        Returns:
+            an instance of SurnameVectorizer
+        """
         char_vocab = SequenceVocabulary.from_serializable(contents['char_vocab'])
         nat_vocab = Vocabulary.from_serializable(contents['nationality_vocab'])
 
         return cls(char_vocab=char_vocab, nationality_vocab=nat_vocab)
 
     def to_serializable(self):
+        """ Returns the serializable contents """
         return {'char_vocab': self.char_vocab.to_serializable(),
                 'nationality_vocab': self.nationality_vocab.to_serializable()}
 
@@ -228,16 +253,6 @@ class SurnameDataset(Dataset):
 
         self.set_split('train')
 
-        # Class weights
-        class_counts = self.train_df.nationality.value_counts().to_dict()
-
-        def sort_key(item):
-            return self._vectorizer.nationality_vocab.lookup_token(item[0])
-
-        sorted_counts = sorted(class_counts.items(), key=sort_key)
-        frequencies = [count for _, count in sorted_counts]
-        self.class_weights = 1.0 / torch.tensor(frequencies, dtype=torch.float32)
-
     @classmethod
     def load_dataset_and_make_vectorizer(cls, surname_csv):
         """Load dataset and make a new vectorizer from scratch
@@ -247,9 +262,9 @@ class SurnameDataset(Dataset):
         Returns:
             an instance of SurnameDataset
         """
+
         surname_df = pd.read_csv(surname_csv)
-        train_surname_df = surname_df[surname_df.split == 'train']
-        return cls(surname_df, SurnameVectorizer.from_dataframe(train_surname_df))
+        return cls(surname_df, SurnameVectorizer.from_dataframe(surname_df))
 
     @classmethod
     def load_dataset_and_load_vectorizer(cls, surname_csv, vectorizer_filepath):
@@ -304,22 +319,19 @@ class SurnameDataset(Dataset):
         Args:
             index (int): the index to the data point
         Returns:
-            a dictionary holding the data point's:
-                features (x_data)
-                label (y_target)
-                feature length (x_length)
+            a dictionary holding the data point: (x_data, y_target, class_index)
         """
         row = self._target_df.iloc[index]
 
-        surname_vector, vec_length = \
+        from_vector, to_vector = \
             self._vectorizer.vectorize(row.surname, self._max_seq_length)
 
         nationality_index = \
             self._vectorizer.nationality_vocab.lookup_token(row.nationality)
 
-        return {'x_data': surname_vector,
-                'y_target': nationality_index,
-                'x_length': vec_length}
+        return {'x_data': from_vector,
+                'y_target': to_vector,
+                'class_index': nationality_index}
 
     def get_num_batches(self, batch_size):
         """Given a batch size, return the number of batches in the dataset
@@ -348,229 +360,133 @@ def generate_batches(dataset, batch_size, shuffle=True,
         yield out_data_dict
 
 
-def column_gather(y_out, x_lengths):
-    '''Get a specific vector from each batch datapoint in `y_out`.
-
-    More precisely, iterate over batch row indices, get the vector that's at
-    the position indicated by the corresponding value in `x_lengths` at the row
-    index.
-
-    Args:
-        y_out (torch.FloatTensor, torch.cuda.FloatTensor)
-            shape: (batch, sequence, feature)
-        x_lengths (torch.LongTensor, torch.cuda.LongTensor)
-            shape: (batch,)
-
-    Returns:
-        y_out (torch.FloatTensor, torch.cuda.FloatTensor)
-            shape: (batch, feature)
-    '''
-    x_lengths = x_lengths.long().detach().cpu().numpy() - 1
-
-    out = []
-    for batch_index, column_index in enumerate(x_lengths):
-        out.append(y_out[batch_index, column_index])
-
-    return torch.stack(out)
-
-
-class ElmanRNN(nn.Module):
-    """ an Elman RNN built using the RNNCell """
-
-    def __init__(self, input_size, hidden_size, batch_first=False):
+class SurnameGenerationModel(nn.Module):
+    def __init__(self, char_embedding_size, char_vocab_size, num_nationalities,
+                 rnn_hidden_size, batch_first=True, padding_idx=0, dropout_p=0.5):
         """
         Args:
-            input_size (int): size of the input vectors
-            hidden_size (int): size of the hidden state vectors
-            bathc_first (bool): whether the 0th dimension is batch
-        """
-        super(ElmanRNN, self).__init__()
-
-        self.rnn_cell = nn.RNNCell(input_size, hidden_size)
-
-        self.batch_first = batch_first
-        self.hidden_size = hidden_size
-
-    def _initial_hidden(self, batch_size):
-        return torch.zeros((batch_size, self.hidden_size))
-
-    def forward(self, x_in, initial_hidden=None):
-        """The forward pass of the ElmanRNN
-
-        Args:
-            x_in (torch.Tensor): an input data tensor.
-                If self.batch_first: x_in.shape = (batch, seq_size, feat_size)
-                Else: x_in.shape = (seq_size, batch, feat_size)
-            initial_hidden (torch.Tensor): the initial hidden state for the RNN
-        Returns:
-            hiddens (torch.Tensor): The outputs of the RNN at each time step.
-                If self.batch_first: hiddens.shape = (batch, seq_size, hidden_size)
-                Else: hiddens.shape = (seq_size, batch, hidden_size)
-        """
-
-        if self.batch_first:
-            batch_size, seq_size, feat_size = x_in.size()
-            x_in = x_in.permute(1, 0, 2)
-        else:
-            seq_size, batch_size, feat_size = x_in.size()
-
-        hiddens = []
-
-        print(f"输入序列形状: {x_in.shape}")
-
-        if initial_hidden is None:
-            initial_hidden = self._initial_hidden(batch_size)
-            initial_hidden = initial_hidden.to(x_in.device)
-
-        hidden_t = initial_hidden
-
-        for t in range(seq_size):
-            hidden_t = self.rnn_cell(x_in[t], hidden_t)
-            hiddens.append(hidden_t)
-
-        hiddens = torch.stack(hiddens)
-
-        if self.batch_first:
-            hiddens = hiddens.permute(1, 0, 2)
-        print(f"RNN 输出形状: {hiddens.shape}")
-        return hiddens
-
-
-class SurnameClassifier(nn.Module):
-    """ A Classifier with an RNN to extract features and an MLP to classify """
-
-    def __init__(self, embedding_size, num_embeddings, num_classes,
-                 rnn_hidden_size, batch_first=True, padding_idx=0):
-        """
-        Args:
-            embedding_size (int): The size of the character embeddings
-            num_embeddings (int): The number of characters to embed
-            num_classes (int): The size of the prediction vector
-                Note: the number of nationalities
+            char_embedding_size (int): The size of the character embeddings
+            char_vocab_size (int): The number of characters to embed
+            num_nationalities (int): The size of the prediction vector
             rnn_hidden_size (int): The size of the RNN's hidden state
             batch_first (bool): Informs whether the input tensors will
                 have batch or the sequence on the 0th dimension
             padding_idx (int): The index for the tensor padding;
                 see torch.nn.Embedding
+            dropout_p (float): the probability of zeroing activations using
+                the dropout method.  higher means more likely to zero.
         """
-        super(SurnameClassifier, self).__init__()
+        super(SurnameGenerationModel, self).__init__()
 
-        self.emb = nn.Embedding(num_embeddings=num_embeddings,
-                                embedding_dim=embedding_size,
-                                padding_idx=padding_idx)
-        self.rnn = ElmanRNN(input_size=embedding_size,
-                            hidden_size=rnn_hidden_size,
-                            batch_first=batch_first)
-        self.fc1 = nn.Linear(in_features=rnn_hidden_size,
-                             out_features=rnn_hidden_size)
-        self.fc2 = nn.Linear(in_features=rnn_hidden_size,
-                             out_features=num_classes)
+        self.char_emb = nn.Embedding(num_embeddings=char_vocab_size,
+                                     embedding_dim=char_embedding_size,
+                                     padding_idx=padding_idx)
 
-    def forward(self, x_in, x_lengths=None, apply_softmax=False):
-        """The forward pass of the classifier
+        self.nation_emb = nn.Embedding(num_embeddings=num_nationalities,
+                                       embedding_dim=rnn_hidden_size)
+
+        self.rnn = nn.GRU(input_size=char_embedding_size,
+                          hidden_size=rnn_hidden_size,
+                          batch_first=batch_first)
+
+        self.fc = nn.Linear(in_features=rnn_hidden_size,
+                            out_features=char_vocab_size)
+
+        self._dropout_p = dropout_p
+
+    def forward(self, x_in, nationality_index, apply_softmax=False):
+        """The forward pass of the model
 
         Args:
             x_in (torch.Tensor): an input data tensor.
-                x_in.shape should be (batch, input_dim)
-            x_lengths (torch.Tensor): the lengths of each sequence in the batch.
-                They are used to find the final vector of each sequence
+                x_in.shape should be (batch, max_seq_size)
+            nationality_index (torch.Tensor): The index of the nationality for each data point
+                Used to initialize the hidden state of the RNN
             apply_softmax (bool): a flag for the softmax activation
                 should be false if used with the Cross Entropy losses
         Returns:
-            the resulting tensor. tensor.shape should be (batch, output_dim)
+            the resulting tensor. tensor.shape should be (batch, char_vocab_size)
         """
-        x_embedded = self.emb(x_in)
-        y_out = self.rnn(x_embedded)
+        x_embedded = self.char_emb(x_in)
 
-        if x_lengths is not None:
-            y_out = column_gather(y_out, x_lengths)
-        else:
-            y_out = y_out[:, -1, :]
+        # hidden_size: (num_layers * num_directions, batch_size, rnn_hidden_size)
+        nationality_embedded = self.nation_emb(nationality_index).unsqueeze(0)
 
-        y_out = F.relu(self.fc1(F.dropout(y_out, 0.5)))
-        y_out = self.fc2(F.dropout(y_out, 0.5))
+        y_out, _ = self.rnn(x_embedded, nationality_embedded)
+
+        batch_size, seq_size, feat_size = y_out.shape
+        y_out = y_out.contiguous().view(batch_size * seq_size, feat_size)
+
+        y_out = self.fc(F.dropout(y_out, p=self._dropout_p))
+
+        if apply_softmax:
+            y_out = F.softmax(y_out, dim=1)
+
+        new_feat_size = y_out.shape[-1]
+        y_out = y_out.view(batch_size, seq_size, new_feat_size)
 
         return y_out
 
-def set_seed_everywhere(seed, cuda):
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if cuda:
-        torch.cuda.manual_seed_all(seed)
 
-def handle_dirs(dirpath):
-    if not os.path.exists(dirpath):
-        os.makedirs(dirpath)
+def sample_from_model(model, vectorizer, nationalities, sample_size=20,
+                      temperature=1.0):
+    """Sample a sequence of indices from the model
+
+    Args:
+        model (SurnameGenerationModel): the trained model
+        vectorizer (SurnameVectorizer): the corresponding vectorizer
+        nationalities (list): a list of integers representing nationalities
+        sample_size (int): the max length of the samples
+        temperature (float): accentuates or flattens
+            the distribution.
+            0.0 < temperature < 1.0 will make it peakier.
+            temperature > 1.0 will make it more uniform
+    Returns:
+        indices (torch.Tensor): the matrix of indices;
+        shape = (num_samples, sample_size)
+    """
+    num_samples = len(nationalities)
+    begin_seq_index = [vectorizer.char_vocab.begin_seq_index
+                       for _ in range(num_samples)]
+    begin_seq_index = torch.tensor(begin_seq_index,
+                                   dtype=torch.int64).unsqueeze(dim=1)
+    indices = [begin_seq_index]
+    nationality_indices = torch.tensor(nationalities, dtype=torch.int64).unsqueeze(dim=0)
+    h_t = model.nation_emb(nationality_indices)
+
+    for time_step in range(sample_size):
+        x_t = indices[time_step]
+        x_emb_t = model.char_emb(x_t)
+        rnn_out_t, h_t = model.rnn(x_emb_t, h_t)
+        prediction_vector = model.fc(rnn_out_t.squeeze(dim=1))
+        probability_vector = F.softmax(prediction_vector / temperature, dim=1)
+        indices.append(torch.multinomial(probability_vector, num_samples=1))
+    indices = torch.stack(indices).squeeze().permute(1, 0)
+    return indices
 
 
-args = Namespace(
-    # Data and path information
-    surname_csv="surnames_with_splits.csv",
-    vectorizer_file="vectorizer.json",
-    model_state_file="model.pth",
-    save_dir="model_storage/ch6/surname_classification",
-    # Model hyper parameter
-    char_embedding_size=100,
-    rnn_hidden_size=64,
-    # Training hyper parameter
-    num_epochs=50,
-    learning_rate=1e-3,
-    batch_size=64,
-    seed=1337,
-    early_stopping_criteria=5,
-    # Runtime hyper parameter
-    cuda=True,
-    catch_keyboard_interrupt=True,
-    reload_from_files=False,
-    expand_filepaths_to_save_dir=True,
-)
+def decode_samples(sampled_indices, vectorizer):
+    """Transform indices into the string form of a surname
 
-# Check CUDA
-if not torch.cuda.is_available():
-    args.cuda = False
+    Args:
+        sampled_indices (torch.Tensor): the inidces from `sample_from_model`
+        vectorizer (SurnameVectorizer): the corresponding vectorizer
+    """
+    decoded_surnames = []
+    vocab = vectorizer.char_vocab
 
-args.device = torch.device("cuda" if args.cuda else "cpu")
-
-print("Using CUDA: {}".format(args.cuda))
-
-if args.expand_filepaths_to_save_dir:
-    args.vectorizer_file = os.path.join(args.save_dir,
-                                        args.vectorizer_file)
-
-    args.model_state_file = os.path.join(args.save_dir,
-                                         args.model_state_file)
-
-# Set seed for reproducibility
-set_seed_everywhere(args.seed, args.cuda)
-
-# handle dirs
-handle_dirs(args.save_dir)
-
-if args.reload_from_files and os.path.exists(args.vectorizer_file):
-    # training from a checkpoint
-    dataset = SurnameDataset.load_dataset_and_load_vectorizer(args.surname_csv,
-                                                              args.vectorizer_file)
-else:
-    # create dataset and vectorizer
-    dataset = SurnameDataset.load_dataset_and_make_vectorizer(args.surname_csv)
-    dataset.save_vectorizer(args.vectorizer_file)
-
-vectorizer = dataset.get_vectorizer()
-
-print("Char Vocab特殊标记索引：",
-      f"<BEGIN>:{vectorizer.char_vocab.begin_seq_index}",
-      f"<END>:{vectorizer.char_vocab.end_seq_index}")
-
-# 打印样本向量化结果
-sample_str = "Zhang"
-vec, length = vectorizer.vectorize(sample_str)
-print(f"样本'{sample_str}'的向量化结果:\n{vec}\n有效长度:{length}")
-
-classifier = SurnameClassifier(embedding_size=args.char_embedding_size,
-                               num_embeddings=len(vectorizer.char_vocab),
-                               num_classes=len(vectorizer.nationality_vocab),
-                               rnn_hidden_size=args.rnn_hidden_size,
-                               padding_idx=vectorizer.char_vocab.mask_index)
+    for sample_index in range(sampled_indices.shape[0]):
+        surname = ""
+        for time_step in range(sampled_indices.shape[1]):
+            sample_item = sampled_indices[sample_index, time_step].item()
+            if sample_item == vocab.begin_seq_index:
+                continue
+            elif sample_item == vocab.end_seq_index:
+                break
+            else:
+                surname += vocab.lookup_index(sample_item)
+        decoded_surnames.append(surname)
+    return decoded_surnames
 
 
 def make_train_state(args):
@@ -590,7 +506,6 @@ def make_train_state(args):
 
 def update_train_state(args, model, train_state):
     """Handle the training state updates.
-
     Components:
      - Early Stopping: Prevent overfitting.
      - Model Checkpoint: Model is saved if the model is better
@@ -632,26 +547,124 @@ def update_train_state(args, model, train_state):
     return train_state
 
 
-def compute_accuracy(y_pred, y_target):
+def normalize_sizes(y_pred, y_true):
+    """Normalize tensor sizes
+
+    Args:
+        y_pred (torch.Tensor): the output of the model
+            If a 3-dimensional tensor, reshapes to a matrix
+        y_true (torch.Tensor): the target predictions
+            If a matrix, reshapes to be a vector
+    """
+    if len(y_pred.size()) == 3:
+        y_pred = y_pred.contiguous().view(-1, y_pred.size(2))
+    if len(y_true.size()) == 2:
+        y_true = y_true.contiguous().view(-1)
+    return y_pred, y_true
+
+
+def compute_accuracy(y_pred, y_true, mask_index):
+    y_pred, y_true = normalize_sizes(y_pred, y_true)
+
     _, y_pred_indices = y_pred.max(dim=1)
-    n_correct = torch.eq(y_pred_indices, y_target).sum().item()
-    return n_correct / len(y_pred_indices) * 100
 
-def compute_accuracy(y_pred, y_target):
-    _, y_pred_indices = y_pred.max(dim=1)
-    n_correct = torch.eq(y_pred_indices, y_target).sum().item()
-    return n_correct / len(y_pred_indices) * 100
+    correct_indices = torch.eq(y_pred_indices, y_true).float()
+    valid_indices = torch.ne(y_true, mask_index).float()
+
+    n_correct = (correct_indices * valid_indices).sum().item()
+    n_valid = valid_indices.sum().item()
+
+    return n_correct / n_valid * 100
 
 
-classifier = classifier.to(args.device)
-dataset.class_weights = dataset.class_weights.to(args.device)
+def sequence_loss(y_pred, y_true, mask_index):
+    y_pred, y_true = normalize_sizes(y_pred, y_true)
+    return F.cross_entropy(y_pred, y_true, ignore_index=mask_index)
 
-loss_func = nn.CrossEntropyLoss(dataset.class_weights)
-optimizer = optim.Adam(classifier.parameters(), lr=args.learning_rate)
+def set_seed_everywhere(seed, cuda):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if cuda:
+        torch.cuda.manual_seed_all(seed)
+
+def handle_dirs(dirpath):
+    if not os.path.exists(dirpath):
+        os.makedirs(dirpath)
+
+
+args = Namespace(
+    # Data and Path information
+    surname_csv="surnames_with_splits.csv",
+    vectorizer_file="vectorizer.json",
+    model_state_file="model.pth",
+    save_dir="model_storage/ch7/model2_conditioned_surname_generation",
+    # Model hyper parameters
+    char_embedding_size=32,
+    rnn_hidden_size=32,
+    # Training hyper parameters
+    seed=1337,
+    learning_rate=0.001,
+    batch_size=128,
+    num_epochs=50,
+    early_stopping_criteria=5,
+    # Runtime options
+    catch_keyboard_interrupt=True,
+    cuda=True,
+    expand_filepaths_to_save_dir=True,
+    reload_from_files=False,
+)
+
+if args.expand_filepaths_to_save_dir:
+    args.vectorizer_file = os.path.join(args.save_dir,
+                                        args.vectorizer_file)
+
+    args.model_state_file = os.path.join(args.save_dir,
+                                         args.model_state_file)
+
+    print("Expanded filepaths: ")
+    print("\t{}".format(args.vectorizer_file))
+    print("\t{}".format(args.model_state_file))
+
+# Check CUDA
+if not torch.cuda.is_available():
+    args.cuda = False
+
+args.device = torch.device("cuda" if args.cuda else "cpu")
+
+print("Using CUDA: {}".format(args.cuda))
+
+# Set seed for reproducibility
+set_seed_everywhere(args.seed, args.cuda)
+
+# handle dirs
+handle_dirs(args.save_dir)
+
+if args.reload_from_files:
+    # training from a checkpoint
+    dataset = SurnameDataset.load_dataset_and_load_vectorizer(args.surname_csv,
+                                                              args.vectorizer_file)
+else:
+    # create dataset and vectorizer
+    dataset = SurnameDataset.load_dataset_and_make_vectorizer(args.surname_csv)
+    dataset.save_vectorizer(args.vectorizer_file)
+
+vectorizer = dataset.get_vectorizer()
+
+model = SurnameGenerationModel(char_embedding_size=args.char_embedding_size,
+                               char_vocab_size=len(vectorizer.char_vocab),
+                               num_nationalities=len(vectorizer.nationality_vocab),
+                               rnn_hidden_size=args.rnn_hidden_size,
+                               padding_idx=vectorizer.char_vocab.mask_index,
+                               dropout_p=0.5)
+
+mask_index = vectorizer.char_vocab.mask_index
+
+model = model.to(args.device)
+
+optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer=optimizer,
                                                  mode='min', factor=0.5,
                                                  patience=1)
-
 train_state = make_train_state(args)
 
 epoch_bar = tqdm(desc='training routine',
@@ -662,20 +675,17 @@ dataset.set_split('train')
 train_bar = tqdm(desc='split=train',
                           total=dataset.get_num_batches(args.batch_size),
                           position=1,
-                          leave=True,
-                 )
+                          leave=True)
 dataset.set_split('val')
 val_bar = tqdm(desc='split=val',
                         total=dataset.get_num_batches(args.batch_size),
                         position=1,
-                        leave=True,
-               )
+                        leave=True)
 
 try:
     for epoch_index in range(args.num_epochs):
         print(f"\nEpoch [{epoch_index + 1}/{args.num_epochs}]")
         print("-" * 50)
-
         train_state['epoch_index'] = epoch_index
 
         # Iterate over training dataset
@@ -687,7 +697,7 @@ try:
                                            device=args.device)
         running_loss = 0.0
         running_acc = 0.0
-        classifier.train()
+        model.train()
 
         for batch_index, batch_dict in enumerate(batch_generator):
             # the training routine is these 5 steps:
@@ -697,13 +707,11 @@ try:
             optimizer.zero_grad()
 
             # step 2. compute the output
-            y_pred = classifier(x_in=batch_dict['x_data'],
-                                x_lengths=batch_dict['x_length'])
+            y_pred = model(x_in=batch_dict['x_data'],
+                           nationality_index=batch_dict['class_index'])
 
             # step 3. compute the loss
-            loss = loss_func(y_pred, batch_dict['y_target'])
-
-            running_loss += (loss.item() - running_loss) / (batch_index + 1)
+            loss = sequence_loss(y_pred, batch_dict['y_target'], mask_index)
 
             # step 4. use loss to produce gradients
             loss.backward()
@@ -711,13 +719,16 @@ try:
             # step 5. use optimizer to take gradient step
             optimizer.step()
             # -----------------------------------------
-            # compute the accuracy
-            acc_t = compute_accuracy(y_pred, batch_dict['y_target'])
+            # compute the  running loss and running accuracy
+            running_loss += (loss.item() - running_loss) / (batch_index + 1)
+            acc_t = compute_accuracy(y_pred, batch_dict['y_target'], mask_index)
             running_acc += (acc_t - running_acc) / (batch_index + 1)
 
             # update bar
             if batch_index % 25 == 0:
-                train_bar.set_postfix(loss=running_loss, acc=running_acc, epoch=epoch_index)
+                train_bar.set_postfix(loss=running_loss,
+                                      acc=running_acc,
+                                      epoch=epoch_index)
             train_bar.update()
 
         train_state['train_loss'].append(running_loss)
@@ -726,113 +737,87 @@ try:
         # Iterate over val dataset
 
         # setup: batch generator, set loss and acc to 0; set eval mode on
-
         dataset.set_split('val')
         batch_generator = generate_batches(dataset,
                                            batch_size=args.batch_size,
                                            device=args.device)
         running_loss = 0.
         running_acc = 0.
-        classifier.eval()
+        model.eval()
 
         for batch_index, batch_dict in enumerate(batch_generator):
             # compute the output
-            y_pred = classifier(x_in=batch_dict['x_data'],
-                                x_lengths=batch_dict['x_length'])
+            y_pred = model(x_in=batch_dict['x_data'],
+                           nationality_index=batch_dict['class_index'])
 
             # step 3. compute the loss
-            loss = loss_func(y_pred, batch_dict['y_target'])
-            running_loss += (loss.item() - running_loss) / (batch_index + 1)
+            loss = sequence_loss(y_pred, batch_dict['y_target'], mask_index)
 
-            # compute the accuracy
-            acc_t = compute_accuracy(y_pred, batch_dict['y_target'])
+            # compute the  running loss and running accuracy
+            running_loss += (loss.item() - running_loss) / (batch_index + 1)
+            acc_t = compute_accuracy(y_pred, batch_dict['y_target'], mask_index)
             running_acc += (acc_t - running_acc) / (batch_index + 1)
+
+            # Update bar
             if batch_index % 25 == 0:
-                val_bar.set_postfix(loss=running_loss, acc=running_acc, epoch=epoch_index)
+                val_bar.set_postfix(loss=running_loss, acc=running_acc,
+                                    epoch=epoch_index)
             val_bar.update()
 
         train_state['val_loss'].append(running_loss)
         train_state['val_acc'].append(running_acc)
 
-        train_state = update_train_state(args=args, model=classifier,
+        train_state = update_train_state(args=args, model=model,
                                          train_state=train_state)
 
         scheduler.step(train_state['val_loss'][-1])
+
+        if train_state['stop_early']:
+            break
+
+        # move model to cpu for sampling
+
+        nationalities = np.random.choice(np.arange(len(vectorizer.nationality_vocab)), replace=True, size=2)
+        model = model.cpu()
+        sampled_surnames = decode_samples(
+            sample_from_model(model, vectorizer, nationalities=nationalities),
+            vectorizer)
+
+        sample1 = "{}->{}".format(vectorizer.nationality_vocab.lookup_index(nationalities[0]),
+                                  sampled_surnames[0])
+        sample2 = "{}->{}".format(vectorizer.nationality_vocab.lookup_index(nationalities[1]),
+                                  sampled_surnames[1])
+        if batch_index % 25 == 0:
+            epoch_bar.set_postfix(sample1=sample1,
+                                  sample2=sample2)
+        # move model back to whichever device it should be on
+        model = model.to(args.device)
 
         train_bar.n = 0
         val_bar.n = 0
         epoch_bar.update()
 
-        if train_state['stop_early']:
-            break
-
 except KeyboardInterrupt:
     print("Exiting loop")
 
-# 打印模型各层参数维度
-print("\n模型结构：")
-for name, param in classifier.named_parameters():
-    print(f"{name.ljust(20)} | 维度：{tuple(param.size())}")
+model = model.cpu()
+for index in range(len(vectorizer.nationality_vocab)):
+    nationality = vectorizer.nationality_vocab.lookup_index(index)
+    print("Sampled for {}: ".format(nationality))
+    sampled_indices = sample_from_model(model, vectorizer,
+                                        nationalities=[index] * 3,
+                                        temperature=0.7)
+    for sampled_surname in decode_samples(sampled_indices, vectorizer):
+        print("-  " + sampled_surname)
 
 
-# compute the loss & accuracy on the test set using the best available model
 
-classifier.load_state_dict(torch.load(train_state['model_filename']))
+1
+nationalities = [1] * 5  # 生成5个捷克语姓氏
+sampled_surnames = decode_samples(
+    sample_from_model(model, vectorizer, nationalities=nationalities),
+    vectorizer)
 
-classifier = classifier.to(args.device)
-dataset.class_weights = dataset.class_weights.to(args.device)
-loss_func = nn.CrossEntropyLoss(dataset.class_weights)
-
-dataset.set_split('test')
-batch_generator = generate_batches(dataset,
-                                   batch_size=args.batch_size,
-                                   device=args.device)
-running_loss = 0.
-running_acc = 0.
-classifier.eval()
-
-for batch_index, batch_dict in enumerate(batch_generator):
-    # compute the output
-    y_pred = classifier(batch_dict['x_data'],
-                        x_lengths=batch_dict['x_length'])
-
-    # compute the loss
-    loss = loss_func(y_pred, batch_dict['y_target'])
-    loss_t = loss.item()
-    running_loss += (loss_t - running_loss) / (batch_index + 1)
-
-    # compute the accuracy
-    acc_t = compute_accuracy(y_pred, batch_dict['y_target'])
-    running_acc += (acc_t - running_acc) / (batch_index + 1)
-
-train_state['test_loss'] = running_loss
-train_state['test_acc'] = running_acc
-
-def predict_nationality(surname, classifier, vectorizer, device):
-    vectorized_surname, vec_length = vectorizer.vectorize(surname)
-
-    vectorized_surname = torch.tensor(vectorized_surname).unsqueeze(dim=0).to(device)
-    vec_length = torch.tensor([vec_length], dtype=torch.int64).to(device)
-
-    result = classifier(vectorized_surname, vec_length, apply_softmax=False)
-
-    result=  F.softmax(result,dim=1)
-
-    probability_values, indices = result.max(dim=1)
-
-    index = indices.item()
-    prob_value = probability_values.item()
-
-    predicted_nationality = vectorizer.nationality_vocab.lookup_index(index)
-
-    return {'nationality': predicted_nationality, 'probability': prob_value, 'surname': surname}
-
-args.device = torch.device("cuda" if args.cuda else "cpu")
-classifier = classifier.to(args.device)
-
-
-# 假设前面的代码已经运行完成，已经有了训练好的模型classifier和vectorizer
-surnames = ["McMahan", "Nakamoto", "Wan", "Cho"]
-for surname in surnames:
-    prediction = predict_nationality(surname, classifier, vectorizer,args.device)
-    print(f"姓氏: {prediction['surname']}, 国籍: {prediction['nationality']}, 置信度: {prediction['probability']:.4f}")
+# 打印生成的捷克语姓氏
+for surname in sampled_surnames:
+    print(surname)
